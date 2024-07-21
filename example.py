@@ -11,11 +11,12 @@ from pystray import MenuItem as item
 from PIL import Image as PILImage
 import threading
 import sys
-
+import os
+from Example2 import open_new_window
 # Global variables
 horizontal_lines = [0.2, 0.4, 0.6, 0.8, 1.0]  # Default values in normalized coordinates
 horizontal_lines_colors = ['blue', 'blue', 'blue', 'blue', 'blue']  # Default colors
-horizontal_lines_names = ['Line A', 'Line B', 'Line C', 'Line D', 'Line E']  # Default names
+horizontal_lines_names = ['1', '2', '3', '4', '5']  # Default names
 vertical_line_positions = []
 alert_messages = {
     'English': "Fire detected on the operator line.",
@@ -81,7 +82,7 @@ def load_image():
     right_image = image[:, width // 2:].copy()  # Make sure to copy to avoid modifying original
 
     messagebox.showinfo("Info", "Image loaded successfully.")
-    process_image()
+    process_image(file_path)
 
 
 # Function to detect fire regions
@@ -115,7 +116,7 @@ def calculate_laplacian_variance(image):
     return laplacian_var
 
 # Function to process the image
-def process_image():
+def process_image(image_path):
     global resized_cropped_contour_image, vertical_line_positions, resized_cropped_contours, approx_curve
 
     # Calculate the Laplacian variance for both images
@@ -187,6 +188,34 @@ def process_image():
             cv2.polylines(resized_cropped_contour_image, [approx_curve], isClosed=False,
                           color=(0, 255, 0), thickness=3)
 
+    output_image = resized_cropped_contour_image.copy()
+    segment_width = vertical_line_positions[1] - vertical_line_positions[0]
+    for idx, (y, color, name) in enumerate(zip(horizontal_lines, horizontal_lines_colors, horizontal_lines_names)):
+        y_pos = int(y * 1000)  # Scale normalized value to image dimension
+
+        # Determine start and end x positions for the horizontal lines
+        if idx == 0:
+            start_x = 0
+        else:
+            start_x = vertical_line_positions[idx - 1]
+
+        if idx < len(vertical_line_positions):
+            end_x = vertical_line_positions[idx]
+        else:
+            end_x = 1000
+
+        #color of the horizontal line in saved image
+        color = (0, 0, 255)  # Convert color name to BGR tuple
+        # Draw the line
+        cv2.line(output_image, (start_x, y_pos), (end_x, y_pos), color=color, thickness=3)
+        # Draw the name
+        cv2.putText(output_image, name, (start_x, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    output_directory = "C:/Users/kreke/PycharmProjects/pythonDetect/wic-cam"  # specify the output directory
+    if not os.path.exists(output_directory):
+        os.makedirs(output_directory)
+    filename = os.path.basename(image_path)
+    output_path = os.path.join(output_directory, f"{filename}_processed.png")
+    cv2.imwrite(output_path, resized_cropped_contour_image)
     update_plot()
 
 # Function to update the plot when user inputs values for horizontal lines
@@ -330,18 +359,43 @@ def apply_entry_values():
 
 # Create the main window
 window = tk.Tk()
-window.title("Fire Detection and Image Processing")
+window.title("Wic-FireCam")
 
-# Configure grid layout for expanding frames
-window.columnconfigure(1, weight=1)
-window.rowconfigure(1, weight=1)
+# Create a frame to hold the preloaded photos
+photo_frame = tk.Frame(window, bg='black', height=10)
+photo_frame.grid(row=0, column=0, columnspan=5, sticky='nsew')
+
+# Configure the columns in the photo_frame to expand equally
+photo_frame.columnconfigure([0, 1, 2], weight=1)
+
+# Load the preloaded photos and place them in the grid
+photo1 = Image.open("icons/newIcon.png")
+photo1 = photo1.resize((150, 100))
+photo1 = ImageTk.PhotoImage(photo1)
+label1 = tk.Label(photo_frame, image=photo1, borderwidth=2, relief='solid', bg='black')
+label1.image = photo1
+label1.grid(row=0, column=0, sticky='nsew', padx=2, pady=2)
+
+photo2 = Image.open("icons/fireIcon2.JPG")
+photo2 = photo2.resize((100, 100))
+photo2 = ImageTk.PhotoImage(photo2)
+label2 = tk.Label(photo_frame, image=photo2, borderwidth=2, relief='solid', bg='black')
+label2.image = photo2
+label2.grid(row=0, column=1, sticky='nsew', padx=2, pady=2)
+
+photo3 = Image.open("icons/tryicon.png")
+photo3 = photo3.resize((100, 100))
+photo3 = ImageTk.PhotoImage(photo3)
+label3 = tk.Label(photo_frame, image=photo3, borderwidth=2, relief='solid', bg='black')
+label3.image = photo3
+label3.grid(row=0, column=2, sticky='nsew', padx=2, pady=2)
 
 # Create a button to load an image
 button_load = tk.Button(window, text="Load Image", command=load_image)
-button_load.grid(row=0, column=0, padx=5, pady=5)
+button_load.grid(row=12, column=0, columnspan=1, pady=10)
 
 button_minimize = tk.Button(window, text="Minimize ", command=minimize_to_tray)
-button_minimize.grid(row=0, column=1, padx=5, pady=5)
+button_minimize.grid(row=12, column=1, columnspan=1, pady=10)
 
 # Create a frame to hold the plot
 frame = tk.Frame(window)
@@ -371,17 +425,14 @@ for i in range(5):
 entries_color = []
 entries_name = []
 color_buttons = []
-color_options = ['green', 'yellow', 'black', 'purple', 'orange']  # Example colors
+color_options = ['green', 'yellow', 'blue', '#C4A484', 'orange']  # Example colors
 for i in range(5):
 
     entry_name = tk.Entry(window)
-
     entry_name.insert(0, horizontal_lines_names[i])
-
+    entry_name.config(state='readonly')  # or 'disabled'
     entry_name.grid(row=i + 7, column=0, padx=5, pady=5, sticky='w')
-
     entries_name.append(entry_name)
-    # Create buttons for each color option
 
     button_frame = tk.Frame(window)
 
@@ -398,7 +449,7 @@ for i in range(5):
 
 # Create a button to apply the values from entries
 button_apply_entries = tk.Button(window, text="Apply Entry Values", command=apply_entry_values)
-button_apply_entries.grid(row=12, column=1, columnspan=2, pady=10)
+button_apply_entries.grid(row=12, column=2, columnspan=2, pady=10)
 
 # Create language change buttons
 button_english = tk.Button(window, text="English", command=lambda: change_language('English'))
@@ -418,5 +469,13 @@ def initialize_ui():
     current_language = get_current_language()
     update_ui_language(current_language)
 
+
+# Create a button to open another window
+
+open_button = tk.Button(window, text="Open Second Window", command=lambda: open_new_window(window))
+open_button.grid(row=13, column=0, pady=10)
+window_resizable_width = config.getboolean('Window', 'resizable_width')
+window_resizable_height = config.getboolean('Window', 'resizable_height')
+window.resizable(window_resizable_width, window_resizable_height)
 initialize_ui()
 window.mainloop()
