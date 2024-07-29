@@ -1,3 +1,5 @@
+import datetime
+import os
 import cv2
 import numpy as np
 from matplotlib import pyplot as plt
@@ -11,13 +13,33 @@ from pystray import MenuItem as item
 from PIL import Image as PILImage
 import threading
 import sys
-import os
+import logging
 from Example2 import open_new_window
+import CustomFormatter
+
+
+# Set up logger
+logger = logging.getLogger('customLogger')
+logger.setLevel(logging.INFO)
+
+# Create file handler and set level to info
+log_file = 'logfile.log'
+CustomFormatter.write_headers_if_needed(log_file)
+fh = logging.FileHandler(log_file)
+fh.setLevel(logging.INFO)
+
+# Create formatter
+formatter = CustomFormatter.CustomFormatter()
+fh.setFormatter(formatter)
+
+# Add handler to logger
+logger.addHandler(fh)
 # Global variables
 horizontal_lines = [0.2, 0.4, 0.6, 0.8, 1.0]  # Default values in normalized coordinates
 horizontal_lines_colors = ['blue', 'blue', 'blue', 'blue', 'blue']  # Default colors
 horizontal_lines_names = ['1', '2', '3', '4', '5']  # Default names
 vertical_line_positions = []
+software_values = []
 alert_messages = {
     'English': "Fire detected on the operator line.",
     'German': "Branddetektor auf dem Betreiber-Linie.",
@@ -115,9 +137,14 @@ def calculate_laplacian_variance(image):
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
     return laplacian_var
 
-# Function to process the image
 def process_image(image_path):
-    global resized_cropped_contour_image, vertical_line_positions, resized_cropped_contours, approx_curve
+
+    global resized_cropped_contour_image, vertical_line_positions, resized_cropped_contours, approx_curve, output_image, bottom_contour_full, software_values, file_name
+
+    file_name = os.path.basename(image_path)
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # Initialize output_image with a default value
+    output_image = None
 
     # Calculate the Laplacian variance for both images
     left_var = calculate_laplacian_variance(left_image)
@@ -135,19 +162,97 @@ def process_image(image_path):
     resize_width = config.getint('Settings', 'resize_width')
     resize_height = config.getint('Settings', 'resize_height')
 
+
+
     # Crop the better image to remove date and exit button
     cropped_image = better_image[:image_height - bottom_crop, :image_width - right_crop]
 
-    # Detect fire regions in the cropped better image
-    cropped_contours = detect_fire_regions(cropped_image)
-
-    # Resize the cropped image to 1024x1024
+    # Resize the cropped image
     resized_cropped_image = cv2.resize(cropped_image, (resize_width, resize_height))
 
-    # Draw a line at the bottom of the resized image
-    cv2.line(resized_cropped_image, (0, resized_cropped_image.shape[0]),
-             (resized_cropped_image.shape[1], resized_cropped_image.shape[0]),
-             (0, 255, 0), thickness=3)
+    # Calculate the width of each piece
+    piece_width = resize_width // 5
+
+    # Create a list to store image pieces
+    pieces = []
+
+    for i in range(5):
+        start_col = i * piece_width
+        if i == 4:  # Ensure the last piece includes any remaining pixels
+            end_col = resize_width
+        else:
+            end_col = (i + 1) * piece_width
+        piece = resized_cropped_image[:, start_col:end_col]
+        pieces.append(piece)
+
+    # Plot the pieces and check for fire regions
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+
+    highest_points_all_pieces = []
+
+    for i, ax in enumerate(axes):
+        piece = pieces[i]
+        contours = detect_fire_regions(piece)
+
+        if contours:
+            longest_contour = max(contours, key=lambda cnt: cv2.arcLength(cnt, True))
+
+            # Find the lowest points of the contour
+            lowest_points = []
+            for point in longest_contour:
+                if point[0][1] > piece.shape[0] * 0.61:  # Use bottom 40% of the image
+                    lowest_points.append(point)
+
+            if lowest_points:
+                # Find the lowest point among the lowest points
+                lowest_point = max(lowest_points, key=lambda point: point[0][1])
+                lowest_y = lowest_point[0][1]
+
+                # Draw a horizontal line starting from the bottom point of the highest point
+                cv2.line(piece, (0, lowest_y), (piece.shape[1] - 1, lowest_y), (0, 255, 0), 4)
+
+                # Print the y-coordinate of the lowest point
+                normalized_y_coord = lowest_y / piece.shape[0]  # Normalize to 0-1 range
+                print(f"Normalized y-coordinate of the lowest point {i + 1}:", normalized_y_coord)
+
+                highest_points_all_pieces.append((i * piece_width, lowest_y))
+        else:
+            highest_points_all_pieces.append((i * piece_width, None))
+
+
+    # Draw the almost straight contour on the entire image
+    if highest_points_all_pieces:
+        # Sort all highest points by x-coordinate
+        highest_points_all_pieces = sorted(highest_points_all_pieces, key=lambda point: point[0])
+        # Draw the contour on the original image
+        bottom_contour_full = []
+        for point in highest_points_all_pieces:
+            if point[1] is not None:
+                bottom_contour_full.append([point[0], point[1]])
+        bottom_contour_full = np.array(bottom_contour_full, dtype=np.int32)
+        #print("Bots contour:", bottom_contour_full)
+        # Print the normalized y-coordinates of the bottom contour
+        normalized_y_coords = [y / resized_cropped_image.shape[0] for x, y in bottom_contour_full]
+       #print("Normalized y-coordinates of the bottom contour:", normalized_y_coords)
+
+        software_values = []
+        for x, y in highest_points_all_pieces:
+            if y is not None:
+                normalized_y_coord = y / resized_cropped_image.shape[0]
+                round_num = round(normalized_y_coord,2)
+                software_values.append(round_num)
+            else:
+                software_values.append(None)
+        # Log example data
+        data = {
+            "timestamp": timestamp,
+            "Software_values": software_values,
+            "Operator_values": horizontal_lines,
+            "image_id": file_name,
+        }
+
+        logger.info(data)
+
 
     # Detect fire regions in the resized better image
     resized_cropped_contours = detect_fire_regions(resized_cropped_image)
@@ -157,66 +262,10 @@ def process_image(image_path):
 
     # Draw 4 vertical red lines at equal intervals using normalized coordinates
     num_lines = 4
-    vertical_line_positions = [int(i * (resized_cropped_image.shape[1] / (num_lines + 1))) for i in
-                               range(1, num_lines + 1)]
+    vertical_line_positions = [int(i * (resized_cropped_image.shape[1] / (num_lines + 1))) for i in range(1, num_lines + 1)]
 
-    for x in vertical_line_positions:
-        cv2.line(resized_cropped_contour_image, (x, 0), (x, resized_cropped_image.shape[0]),
-                 (0, 0, 255), thickness=3)
-
-    # Find the longest contour
-    if resized_cropped_contours:
-        longest_contour = max(resized_cropped_contours, key=lambda cnt: cv2.arcLength(cnt, True))
-    else:
-        longest_contour = None
-
-    # Draw a curve that approximates the bottom of the longest contour
-    if longest_contour is not None:
-        # Extract the bottom half of the contour points
-        bottom_half_points = []
-        for point in longest_contour:
-            if point[0][1] > resized_cropped_image.shape[0] // 1.6:
-                bottom_half_points.append(point)
-
-        bottom_half_points = np.array(bottom_half_points)
-
-        if len(bottom_half_points) > 0:
-            epsilon = 0.01 * cv2.arcLength(bottom_half_points, True)
-            approx_curve = cv2.approxPolyDP(bottom_half_points, epsilon, closed=False)
-
-            # Draw the approximated curve
-            cv2.polylines(resized_cropped_contour_image, [approx_curve], isClosed=False,
-                          color=(0, 255, 0), thickness=3)
-
-    output_image = resized_cropped_contour_image.copy()
-    segment_width = vertical_line_positions[1] - vertical_line_positions[0]
-    for idx, (y, color, name) in enumerate(zip(horizontal_lines, horizontal_lines_colors, horizontal_lines_names)):
-        y_pos = int(y * 1000)  # Scale normalized value to image dimension
-
-        # Determine start and end x positions for the horizontal lines
-        if idx == 0:
-            start_x = 0
-        else:
-            start_x = vertical_line_positions[idx - 1]
-
-        if idx < len(vertical_line_positions):
-            end_x = vertical_line_positions[idx]
-        else:
-            end_x = 1000
-
-        #color of the horizontal line in saved image
-        color = (0, 0, 255)  # Convert color name to BGR tuple
-        # Draw the line
-        cv2.line(output_image, (start_x, y_pos), (end_x, y_pos), color=color, thickness=3)
-        # Draw the name
-        cv2.putText(output_image, name, (start_x, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-    output_directory = "C:/Users/kreke/PycharmProjects/pythonDetect/wic-cam"  # specify the output directory
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
-    filename = os.path.basename(image_path)
-    output_path = os.path.join(output_directory, f"{filename}_processed.png")
-    cv2.imwrite(output_path, resized_cropped_contour_image)
     update_plot()
+
 
 # Function to update the plot when user inputs values for horizontal lines
 def update_plot():
@@ -228,7 +277,9 @@ def update_plot():
 
 # Function to display image with x and y axes and adjustable horizontal lines in the GUI
 def display_image(image):
+    new_directory_image_save = config.get('Settings', 'directory_image_save')
     # Convert the image to RGB
+    global file_name
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     image_pil = Image.fromarray(image_rgb)
 
@@ -255,7 +306,7 @@ def display_image(image):
     alert_shown = False
     for idx, (y, color, name) in enumerate(zip(horizontal_lines, horizontal_lines_colors, horizontal_lines_names)):
         y_pos = int(y * 1000)  # Scale normalized value to image dimension
-
+        #in needs to log the image name, horizontal_lines values, normalized_y_coords values and timestamp in one line
         # Determine start and end x positions for the horizontal lines
         if idx == 0:
             start_x = 0
@@ -270,10 +321,8 @@ def display_image(image):
         current_language = get_current_language()
         ax.plot([start_x, end_x], [y_pos, y_pos], color=color, linewidth=2)
         ax.text(start_x, y_pos, name, color=color, fontsize=10, ha='right')
+        print(start_x, end_x, y_pos)
 
-        # Check for intersection with the approximated curve
-        if check_intersection_with_curve(start_x, end_x, y_pos):
-            messagebox.showinfo("Alert", alert_messages.get(current_language, alert_messages['English']))
 
     # Embed the plot in the tkinter window
     for widget in frame.winfo_children():
@@ -283,9 +332,25 @@ def display_image(image):
     canvas.draw()
     canvas.get_tk_widget().pack()
 
+    if not os.path.exists(new_directory_image_save):
+        os.makedirs(new_directory_image_save)
+
+
+    plot_path = os.path.join(new_directory_image_save, f"{file_name}_processed.png")
+    plt.savefig(plot_path)
+
     # Close the figure to free up memory
     plt.close(fig)
 
+def check_for_alarms():
+    global horizontal_lines, software_values, alert_messages
+
+    for horizontal_line, software_value in zip(horizontal_lines, software_values):
+        if software_value is not None and abs(horizontal_line - software_value) < 0.01:  # Adjust tolerance as needed
+            current_language = get_current_language()
+            message = alert_messages.get(current_language, "Alarm triggered.")
+            messagebox.showwarning("Alarm", message)
+            break  # Stop checking after the first alarm is triggered
 
 # Function to handle language button press
 def change_language(language):
@@ -311,32 +376,8 @@ def update_ui_language(language):
 
     for i, label in enumerate(labels):
         label.config(text=labels_text[i])
+
 # Function to check if a horizontal line intersects with the approximated curve
-def check_intersection_with_curve(start_x, end_x, y_pos):
-    if approx_curve is None:
-        return False
-
-    for i in range(len(approx_curve) - 1):
-        x1, y1 = approx_curve[i][0]
-        x2, y2 = approx_curve[i + 1][0]
-
-        # Check if the horizontal line is within the x bounds of the curve segment
-        if min(x1, x2) <= end_x and max(x1, x2) >= start_x:
-            # Calculate the y value of the curve at the start and end x positions of the horizontal line
-            y_at_start_x = interpolate_y(x1, y1, x2, y2, start_x)
-            y_at_end_x = interpolate_y(x1, y1, x2, y2, end_x)
-
-            # Check if the horizontal line intersects the curve segment
-            if (y1 <= y_pos <= y2 or y2 <= y_pos <= y1) and (y_at_start_x <= y_pos <= y_at_end_x or y_at_end_x <= y_pos <= y_at_start_x):
-                return True
-
-    return False
-
-# Function to interpolate the y value of a point on a line segment given x
-def interpolate_y(x1, y1, x2, y2, x):
-    if x1 == x2:  # Avoid division by zero
-        return y1
-    return y1 + (y2 - y1) * (x - x1) / (x2 - x1)
 
 # Function to update horizontal line heights from sliders
 def update_heights(*args):
@@ -346,6 +387,7 @@ def update_heights(*args):
         entry_height.delete(0, tk.END)
         entry_height.insert(0, f"{horizontal_lines[i]:.2f}")
     update_plot()
+    check_for_alarms()
 
 def set_line_color(index, color):
     horizontal_lines_colors[index] = color
@@ -355,6 +397,7 @@ def apply_entry_values():
     global horizontal_lines
     horizontal_lines = [float(entry_height.get()) for entry_height in entries_height]
     update_plot()
+    check_for_alarms()
 
 
 # Create the main window
@@ -453,13 +496,13 @@ button_apply_entries.grid(row=12, column=2, columnspan=2, pady=10)
 
 # Create language change buttons
 button_english = tk.Button(window, text="English", command=lambda: change_language('English'))
-button_english.grid(row=13, column=0, pady=10)
+button_english.grid(row=13, column=1, pady=10)
 
 button_german = tk.Button(window, text="German", command=lambda: change_language('German'))
-button_german.grid(row=13, column=1, pady=10)
+button_german.grid(row=13, column=2, pady=10)
 
 button_italian = tk.Button(window, text="Italian", command=lambda: change_language('Italian'))
-button_italian.grid(row=13, column=2, pady=10)
+button_italian.grid(row=13, column=3, pady=10)
 
 # Create a label to display the image
 label_image = tk.Label(window)
@@ -472,7 +515,7 @@ def initialize_ui():
 
 # Create a button to open another window
 
-open_button = tk.Button(window, text="Open Second Window", command=lambda: open_new_window(window))
+open_button = tk.Button(window, text="Open History Window", command=lambda: open_new_window(window))
 open_button.grid(row=13, column=0, pady=10)
 window_resizable_width = config.getboolean('Window', 'resizable_width')
 window_resizable_height = config.getboolean('Window', 'resizable_height')
