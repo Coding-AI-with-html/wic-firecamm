@@ -1,11 +1,12 @@
 import datetime
 import os
+import shutil
 import cv2
 import numpy as np
 from matplotlib import pyplot as plt
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import configparser
 import pystray
@@ -15,25 +16,28 @@ import threading
 import sys
 import logging
 from Example2 import open_new_window
+from AreaSelection import RectangleCropper
 import CustomFormatter
+import time
 
+def get_config_path():
+    if getattr(sys, 'frozen', False):  # Check if the program is running as a PyInstaller bundle
+        base_path = sys._MEIPASS  # _MEIPASS is where PyInstaller bundles the files
+        return os.path.join(base_path, 'configuration', 'config.ini')
+    else:
+        base_path = os.path.dirname(__file__)  # Development environment
+        return os.path.join(base_path, 'config.ini')
+
+# Read configuration
+config = configparser.ConfigParser()
+config_path = get_config_path()
+config.read(config_path)
 
 # Set up logger
 logger = logging.getLogger('customLogger')
 logger.setLevel(logging.INFO)
 
-# Create file handler and set level to info
-log_file = 'logfile.log'
-CustomFormatter.write_headers_if_needed(log_file)
-fh = logging.FileHandler(log_file)
-fh.setLevel(logging.INFO)
 
-# Create formatter
-formatter = CustomFormatter.CustomFormatter()
-fh.setFormatter(formatter)
-
-# Add handler to logger
-logger.addHandler(fh)
 # Global variables
 horizontal_lines = [0.2, 0.4, 0.6, 0.8, 1.0]  # Default values in normalized coordinates
 horizontal_lines_colors = ['blue', 'blue', 'blue', 'blue', 'blue']  # Default colors
@@ -47,9 +51,69 @@ alert_messages = {
 }
 approx_curve = None  # To store the green curved line
 resized_cropped_contour_image = None  # Initialize it as None
+image = None
 
-config = configparser.ConfigParser()
-config.read('config.ini')
+def move_png_files():
+    while True:
+        current_time = datetime.datetime.now().time()
+        if current_time.hour == 23 and current_time.minute == 58:
+            today = datetime.datetime.now().strftime('%d.%m.%Y')
+            folder_path = os.path.join(config.get('Settings', 'root_image'), today)
+            if not os.path.exists(folder_path):
+                os.makedirs(folder_path)
+
+            # Move logfile with the current date to the created folder
+            log_file_name = f'logfile_{today}.log'
+            log_file_path = os.path.join(config.get('Settings', 'root_image'), log_file_name)
+            if os.path.exists(log_file_path):
+                shutil.move(log_file_path, folder_path)
+
+            for root, dirs, files in os.walk(config.get('Settings', 'root_image')):
+                for file in files:
+                    if file.endswith('.png'):
+                        shutil.move(os.path.join(root, file), folder_path)
+            time.sleep(60)  # wait for 1 minute to avoid infinite loop
+        else:
+            time.sleep(1)  # wait for 1 second and check again
+
+# Run the function in a separate thread to avoid blocking the main thread
+threading.Thread(target=move_png_files).start()
+
+
+def create_log_file(data):
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    base_directory = config.get('Settings', 'root_image')
+    folder_path = os.path.join(base_directory, today)
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+
+    log_file = os.path.join(folder_path, f'logfile_{today}.log')
+    CustomFormatter.write_headers_if_needed(log_file)
+    logger = logging.getLogger('customLogger')
+    logger.handlers.clear()  # Remove all existing handlers
+    fh = logging.FileHandler(log_file)
+    fh.setLevel(logging.INFO)
+    formatter = CustomFormatter.CustomFormatter()
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    logger.info(data)
+
+
+def create_folder_for_today(plot, filename):
+    # Get the current date and format it as 'DD-MM'
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    base_dir = config.get('Settings', 'root_image')
+
+    # Create the full path for the folder to be created
+    folder_path = os.path.join(base_dir, today)
+
+    # Check if the folder already exists
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+
+    plot_path = os.path.join(folder_path, f"{filename}")
+    plot.savefig(plot_path)
+
 
 def get_current_language():
     return config.get('Settings', 'language', fallback='English')
@@ -63,7 +127,8 @@ def set_current_language(language):
         config.write(configfile)
 def minimize_to_tray():
     window.withdraw()
-    image = PILImage.open("pijus/camera.png")  # Path to your icon image
+    image_min = resource_path('icons/camera.png')
+    image = PILImage.open(image_min)  # Path to your icon image
 
     current_language = get_current_language()
     menu_text = {
@@ -88,23 +153,18 @@ def on_show(icon, item):
 def on_exit(icon, item):
     icon.stop()
     window.quit()
-    sys.exit()
+    os._exit(0)
 # Function to load an image
 def load_image():
-    global image, left_image, right_image, resized_cropped_contour_image
+    global image, resized_cropped_contour_image
     file_path = filedialog.askopenfilename()
     if not file_path:
         return
 
     image = cv2.imread(file_path)
 
-    # Split the image into left and right sides
-    height, width, _ = image.shape
-    left_image = image[:, :width // 2].copy()  # Make sure to copy to avoid modifying original
-    right_image = image[:, width // 2:].copy()  # Make sure to copy to avoid modifying original
-
     messagebox.showinfo("Info", "Image loaded successfully.")
-    process_image(file_path)
+    process_image_with_multiple_sub_images(file_path)
 
 
 # Function to detect fire regions
@@ -137,139 +197,105 @@ def calculate_laplacian_variance(image):
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
     return laplacian_var
 
-def process_image(image_path):
 
+def process_image_with_multiple_sub_images(image_path):
     global resized_cropped_contour_image, vertical_line_positions, resized_cropped_contours, approx_curve, output_image, bottom_contour_full, software_values, file_name
 
     file_name = os.path.basename(image_path)
+    file_name_no_ext, file_ext = os.path.splitext(file_name)
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    # Initialize output_image with a default value
     output_image = None
 
-    # Calculate the Laplacian variance for both images
-    left_var = calculate_laplacian_variance(left_image)
-    right_var = calculate_laplacian_variance(right_image)
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"Error loading image {file_name}")
+        return
 
-    # Determine which image is better quality
-    better_image = left_image if left_var > right_var else right_image
+    # Read the rectangles' coordinates from the config file
+    config.read('config.ini')
+    rectangles = config.items('Cropped_Rectangles')
+    rectangles = [(int(coords.split(',')[0][1:]), int(coords.split(',')[1]), int(coords.split(',')[2]), int(coords.split(',')[3][:-1])) for key, coords in rectangles]
+    print("Recs: ", rectangles)
 
-    # Analyze the resolution of the better image
-    image_height, image_width = better_image.shape[:2]
-
-    # Decide crop area based on the resolution to remove date and exit button
-    bottom_crop = config.getint('Settings', 'bottom_crop')
-    right_crop = config.getint('Settings', 'right_crop')
     resize_width = config.getint('Settings', 'resize_width')
     resize_height = config.getint('Settings', 'resize_height')
+    number_of_tracks = config.getint('Settings', 'number_of_tracks')
 
+    max_variance = 100.0
 
+    for idx, (x1, y1, x2, y2) in enumerate(rectangles):
+        # Crop the rectangle from the image
+        cropped_image = image[y1:y2, x1:x2]
+        resized_cropped_image = cv2.resize(cropped_image, (resize_width, resize_height))
 
-    # Crop the better image to remove date and exit button
-    cropped_image = better_image[:image_height - bottom_crop, :image_width - right_crop]
+        laplacian_variance = calculate_laplacian_variance(resized_cropped_image)
+        quality = round(min(laplacian_variance / max_variance, 1.0), 2)  # Round quality to 2 decimal places
 
-    # Resize the cropped image
-    resized_cropped_image = cv2.resize(cropped_image, (resize_width, resize_height))
+        piece_width = resize_width // number_of_tracks
+        pieces = [resized_cropped_image[:, i * piece_width:(i + 1) * piece_width] for i in range(number_of_tracks)]
 
-    # Calculate the width of each piece
-    piece_width = resize_width // 5
+        fig, axes = plt.subplots(1, number_of_tracks, figsize=(20, 4))
+        highest_points_all_pieces = []
 
-    # Create a list to store image pieces
-    pieces = []
+        for i, ax in enumerate(axes):
+            piece = pieces[i]
+            contours = detect_fire_regions(piece)
 
-    for i in range(5):
-        start_col = i * piece_width
-        if i == 4:  # Ensure the last piece includes any remaining pixels
-            end_col = resize_width
-        else:
-            end_col = (i + 1) * piece_width
-        piece = resized_cropped_image[:, start_col:end_col]
-        pieces.append(piece)
+            if contours:
+                longest_contour = max(contours, key=lambda cnt: cv2.arcLength(cnt, True))
+                lowest_points = [point for point in longest_contour if point[0][1] > piece.shape[0] * 0.61]
 
-    # Plot the pieces and check for fire regions
-    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
-
-    highest_points_all_pieces = []
-
-    for i, ax in enumerate(axes):
-        piece = pieces[i]
-        contours = detect_fire_regions(piece)
-
-        if contours:
-            longest_contour = max(contours, key=lambda cnt: cv2.arcLength(cnt, True))
-
-            # Find the lowest points of the contour
-            lowest_points = []
-            for point in longest_contour:
-                if point[0][1] > piece.shape[0] * 0.61:  # Use bottom 40% of the image
-                    lowest_points.append(point)
-
-            if lowest_points:
-                # Find the lowest point among the lowest points
-                lowest_point = max(lowest_points, key=lambda point: point[0][1])
-                lowest_y = lowest_point[0][1]
-
-                # Draw a horizontal line starting from the bottom point of the highest point
-                cv2.line(piece, (0, lowest_y), (piece.shape[1] - 1, lowest_y), (0, 255, 0), 4)
-
-                # Print the y-coordinate of the lowest point
-                normalized_y_coord = lowest_y / piece.shape[0]  # Normalize to 0-1 range
-                print(f"Normalized y-coordinate of the lowest point {i + 1}:", normalized_y_coord)
-
-                highest_points_all_pieces.append((i * piece_width, lowest_y))
-        else:
-            highest_points_all_pieces.append((i * piece_width, None))
-
-
-    # Draw the almost straight contour on the entire image
-    if highest_points_all_pieces:
-        # Sort all highest points by x-coordinate
-        highest_points_all_pieces = sorted(highest_points_all_pieces, key=lambda point: point[0])
-        # Draw the contour on the original image
-        bottom_contour_full = []
-        for point in highest_points_all_pieces:
-            if point[1] is not None:
-                bottom_contour_full.append([point[0], point[1]])
-        bottom_contour_full = np.array(bottom_contour_full, dtype=np.int32)
-        #print("Bots contour:", bottom_contour_full)
-        # Print the normalized y-coordinates of the bottom contour
-        normalized_y_coords = [y / resized_cropped_image.shape[0] for x, y in bottom_contour_full]
-       #print("Normalized y-coordinates of the bottom contour:", normalized_y_coords)
+                if lowest_points:
+                    lowest_point = max(lowest_points, key=lambda point: point[0][1])
+                    lowest_y = lowest_point[0][1]
+                    cv2.line(piece, (0, lowest_y), (piece.shape[1] - 1, lowest_y), (0, 255, 0), 4)
+                    normalized_y_coord = lowest_y / piece.shape[0]
+                    highest_points_all_pieces.append((i * piece_width, lowest_y))
+                else:
+                    highest_points_all_pieces.append((i * piece_width, None))
+            else:
+                highest_points_all_pieces.append((i * piece_width, None))
 
         software_values = []
-        for x, y in highest_points_all_pieces:
-            if y is not None:
-                normalized_y_coord = y / resized_cropped_image.shape[0]
-                round_num = round(normalized_y_coord,2)
+        for point in highest_points_all_pieces:
+            if point[1] is not None:
+                normalized_y_coord = point[1] / resized_cropped_image.shape[0]
+                round_num = round(normalized_y_coord, 2)
                 software_values.append(round_num)
             else:
                 software_values.append(None)
-        # Log example data
+
+        view = f"{file_name_no_ext}_#{idx + 1}{file_ext}" if len(rectangles) > 1 else f"{file_name_no_ext}_#{idx + 1}{file_ext}"
         data = {
             "timestamp": timestamp,
+            'num_tracks': number_of_tracks,
             "Software_values": software_values,
-            "Operator_values": horizontal_lines,
+            "Operator_values": horizontal_lines,  # Replace with your actual horizontal lines data if available
+            "quality": quality,  # Ensure quality is logged with two decimal places
             "image_id": file_name,
+            "view": view
         }
 
-        logger.info(data)
+        create_log_file(data)
 
+        resized_cropped_contour_image = resized_cropped_image.copy()
 
-    # Detect fire regions in the resized better image
-    resized_cropped_contours = detect_fire_regions(resized_cropped_image)
+        if number_of_tracks > 1:
+            num_lines = number_of_tracks - 1
+        else:
+            num_lines = number_of_tracks
 
-    # Create an output image to draw results
-    resized_cropped_contour_image = resized_cropped_image.copy()
+        vertical_line_positions = [int(i * (resized_cropped_image.shape[1] / (num_lines + 1))) for i in range(1, num_lines + 1)]
 
-    # Draw 4 vertical red lines at equal intervals using normalized coordinates
-    num_lines = 4
-    vertical_line_positions = [int(i * (resized_cropped_image.shape[1] / (num_lines + 1))) for i in range(1, num_lines + 1)]
+        save_view_as_image(resized_cropped_image, vertical_line_positions, view)
 
-    update_plot()
+        update_plot()
 
 
 # Function to update the plot when user inputs values for horizontal lines
 def update_plot():
     global resized_cropped_contour_image
+
     if resized_cropped_contour_image is None:
         # passing error could be added messagebox.showwarning("Warning", "No image has been processed yet.")
         return
@@ -277,7 +303,6 @@ def update_plot():
 
 # Function to display image with x and y axes and adjustable horizontal lines in the GUI
 def display_image(image):
-    new_directory_image_save = config.get('Settings', 'directory_image_save')
     # Convert the image to RGB
     global file_name
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -321,7 +346,7 @@ def display_image(image):
         current_language = get_current_language()
         ax.plot([start_x, end_x], [y_pos, y_pos], color=color, linewidth=2)
         ax.text(start_x, y_pos, name, color=color, fontsize=10, ha='right')
-        print(start_x, end_x, y_pos)
+
 
 
     # Embed the plot in the tkinter window
@@ -332,16 +357,60 @@ def display_image(image):
     canvas.draw()
     canvas.get_tk_widget().pack()
 
-    if not os.path.exists(new_directory_image_save):
-        os.makedirs(new_directory_image_save)
-
-
-    plot_path = os.path.join(new_directory_image_save, f"{file_name}_processed.png")
-    plt.savefig(plot_path)
-
     # Close the figure to free up memory
     plt.close(fig)
 
+
+def save_view_as_image(image, vertical_lines, view):
+    global horizontal_lines, horizontal_lines_colors, horizontal_lines_names
+    # Convert the image to RGB
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image_pil = Image.fromarray(image_rgb)
+
+    # Create a figure for the matplotlib plot
+    fig, ax = plt.subplots()
+    ax.imshow(image_pil)
+    ax.set_xticks([0, 200, 400, 600, 800, 1000])
+    ax.set_xticklabels(['0', '0.2', '0.4', '0.6', '0.8', '1'])
+    ax.set_yticks([0, 200, 400, 600, 800, 1000])
+    ax.set_yticklabels(['0', '0.2', '0.4', '0.6', '0.8', '1'])
+    ax.set_xlim(0, 1000)
+    ax.set_ylim(1000, 0)  # Inverted y-axis
+    ax.xaxis.set_ticks_position('top')
+    ax.xaxis.set_label_position('top')
+    ax.set_xlabel('X-axis')
+    ax.set_ylabel('Y-axis')
+
+    # Draw vertical lines
+    for x in vertical_lines:
+        ax.axvline(x=x, color='red', linestyle='-', linewidth=2)
+
+    # Draw adjustable horizontal lines between vertical lines
+    segment_width = vertical_lines[1] - vertical_lines[0]
+    alert_shown = False
+    for idx, (y, color, name) in enumerate(zip(horizontal_lines, horizontal_lines_colors, horizontal_lines_names)):
+        y_pos = int(y * 1000)  # Scale normalized value to image dimension
+
+        # Determine start and end x positions for the horizontal lines
+        if idx == 0:
+            start_x = 0
+        else:
+            start_x = vertical_lines[idx - 1]
+
+        if idx < len(vertical_lines):
+            end_x = vertical_lines[idx]
+        else:
+            end_x = 1000
+
+        current_language = get_current_language()
+        ax.plot([start_x, end_x], [y_pos, y_pos], color=color, linewidth=2)
+        ax.text(start_x, y_pos, name, color=color, fontsize=10, ha='right')
+
+    # Save the plot
+    create_folder_for_today(fig, view)
+
+    # Close the figure to free up memory
+    plt.close(fig)
 def check_for_alarms():
     global horizontal_lines, software_values, alert_messages
 
@@ -363,21 +432,26 @@ def update_ui_language(language):
         button_load.config(text='Load Image')
         button_minimize.config(text='Minimize Application')
         button_apply_entries.config(text='Apply Entry Values')
+        button_config.config(text="Configuration")
+        open_button.config(text="Open History Window")
     elif language == 'German':
         labels_text = ['Horizontale Linie A:', 'Horizontale Linie B:', 'Horizontale Linie C:', 'Horizontale Linie D:',  'Horizontale Linie E:']
         button_load.config(text='Bild Laden')
         button_minimize.config(text='Anwendung minimieren')
         button_apply_entries.config(text='Eintragswerte Anwenden')
+        button_config.config(text="Konfiguration")
+        open_button.config(text="Öffnen Sie das Verlaufsfenster")
     elif language == 'Italian':
         labels_text = ['Linea Orizzontale A:', 'Linea Orizzontale B:', 'Linea Orizzontale C:', 'Linea Orizzontale D:',  'Linea Orizzontale E:']
         button_load.config(text='Carica Immagine')
         button_minimize.config(text='Riduci al minimo l\'applicazione')
         button_apply_entries.config(text='Applica Valori Inseriti')
+        button_config.config(text="Configurazione")
+        open_button.config(text="Apri la finestra della cronologia")
 
     for i, label in enumerate(labels):
         label.config(text=labels_text[i])
 
-# Function to check if a horizontal line intersects with the approximated curve
 
 # Function to update horizontal line heights from sliders
 def update_heights(*args):
@@ -389,9 +463,12 @@ def update_heights(*args):
     update_plot()
     check_for_alarms()
 
+
 def set_line_color(index, color):
     horizontal_lines_colors[index] = color
     update_plot()
+
+
 # Function to apply values from entries
 def apply_entry_values():
     global horizontal_lines
@@ -403,30 +480,183 @@ def apply_entry_values():
 # Create the main window
 window = tk.Tk()
 window.title("Wic-FireCam")
-
 # Create a frame to hold the preloaded photos
 photo_frame = tk.Frame(window, bg='black', height=10)
 photo_frame.grid(row=0, column=0, columnspan=5, sticky='nsew')
-
 # Configure the columns in the photo_frame to expand equally
 photo_frame.columnconfigure([0, 1, 2], weight=1)
 
+def open_original_image():
+    global image
+
+    if image is not None:
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        photo = Image.fromarray(image_rgb)
+
+        # Get the screen width and height
+        screen_width = window.winfo_screenwidth()
+        screen_height = window.winfo_screenheight()
+
+        # Calculate the scale factor to make the image fit in fullscreen
+        scale_factor = min(screen_width / photo.width, screen_height / photo.height)
+
+        # Resize the image using the scale factor
+        new_width = int(photo.width * scale_factor)
+        new_height = int(photo.height * scale_factor)
+
+        # Create a photo image for Tkinter
+        resized_photo = photo.resize((new_width, new_height))
+        resized_photo_tk = ImageTk.PhotoImage(resized_photo)
+
+        window_original_image = tk.Toplevel()
+        window_original_image.title("Area Of Interest Picking")
+        window_original_image.geometry(f"{new_width}x{new_height+150}")
+
+        canvas = tk.Canvas(window_original_image, width=new_width, height=new_height, cursor="cross")
+        canvas.pack(fill=tk.BOTH, expand=True)
+        canvas.create_image(0, 0, anchor=tk.NW, image=resized_photo_tk)
+
+        # Allow window to be resizable
+        window_original_image.resizable(True, True)
+
+        # Keep a reference of the resized photo to prevent garbage collection
+        label_original_image = tk.Label(window_original_image, image=resized_photo_tk)
+        label_original_image.image = resized_photo_tk
+
+        # Add cropping functionality
+        rectangles = []
+        current_rectangle = None
+
+        # Drop-down menu for selecting the number of rectangles
+        rectangle_count_var = tk.IntVar(value=3)  # Default to 3
+        rectangle_count_menu = tk.OptionMenu(window_original_image, rectangle_count_var, 1, 2, 3, 4, 5, 6)
+        rectangle_count_menu.pack(side=tk.TOP)
+
+        def on_button_press(event):
+            nonlocal current_rectangle
+            if len(rectangles) < rectangle_count_var.get():  # Limit based on user selection
+                current_rectangle = [event.x, event.y, event.x, event.y]
+                rectangles.append(current_rectangle)
+                redraw_rectangles()
+
+        def on_mouse_drag(event):
+            nonlocal current_rectangle
+            if current_rectangle:
+                current_rectangle[2] = event.x
+                current_rectangle[3] = event.y
+                redraw_rectangles()
+
+        def on_button_release(event):
+            nonlocal current_rectangle
+            if current_rectangle:
+                current_rectangle = None
+
+        def redraw_rectangles():
+            canvas.delete("rect")
+            for i, rect in enumerate(rectangles):
+                canvas.create_rectangle(rect[0], rect[1], rect[2], rect[3], outline="blue", tags="rect")
+                canvas.create_text(rect[0], rect[1], text=f"Rect {i+1}", anchor=tk.NW, fill="blue")
+
+        def reset_selection():
+            nonlocal rectangles, current_rectangle
+            rectangles.clear()
+            current_rectangle = None
+            canvas.delete("all")  # Clear the canvas
+            canvas.create_image(0, 0, anchor=tk.NW, image=resized_photo_tk)  # Redraw the image
+            redraw_rectangles()  # Redraw the rectangles (which are now empty)
+
+
+        def close_window():
+            window_original_image.destroy()
+
+        def crop_rectangles():
+            if len(rectangles) == 0:
+                messagebox.showwarning("No Views", "Please pick view first.")
+                return
+
+            with open('config.ini', 'w') as configfile:
+                config.write(configfile)
+            config.read('config.ini')
+
+            if 'Cropped_Rectangles' not in config:
+                config.add_section('Cropped_Rectangles')
+
+            # Remove excess rectangles from config file
+            for i in range(len(rectangles), len(config.options('Cropped_Rectangles'))):
+                config.remove_option('Cropped_Rectangles', f'Rectangle_{i + 1}')
+
+            for i, rect in enumerate(rectangles):
+                x1, y1, x2, y2 = map(int, rect)
+                crop_rectangle = (
+                    int(x1 * photo.width / new_width),
+                    int(y1 * photo.height / new_height),
+                    int(x2 * photo.width / new_width),
+                    int(y2 * photo.height / new_height)
+                )
+
+                cropped_image = photo.crop(crop_rectangle)
+                # cropped_image.save(f"cropped_rectangle_{i + 1}.png")
+
+                config.set('Cropped_Rectangles', f'Rectangle_{i + 1}', str(crop_rectangle))
+
+            with open('config.ini', 'w') as configfile:
+                config.write(configfile)
+
+            messagebox.showinfo("Success",
+                                f"Cropped {len(rectangles)} saved coordinates to config.ini")
+
+        canvas.bind("<ButtonPress-1>", on_button_press)
+        canvas.bind("<B1-Motion>", on_mouse_drag)
+        canvas.bind("<ButtonRelease-1>", on_button_release)
+
+        reset_button = tk.Button(window_original_image, text="Reset Selection", command=reset_selection)
+        reset_button.pack(side=tk.BOTTOM, padx=10, pady=10)
+
+        crop_button = tk.Button(window_original_image, text="Save Views", command=crop_rectangles)
+        crop_button.pack(side=tk.BOTTOM, padx=10, pady=10)
+
+        close_button = tk.Button(window_original_image, text="Close Configuration", command=close_window)
+        close_button.pack()
+
+        window_original_image.mainloop()
+
+    else:
+        messagebox.showinfo("Info", "No image has been loaded yet.")
+
+
+def config_area():
+    global entries_config
+    entries_config = []
+    open_original_image()  # Open the original image in a new window
+
+def resource_path(relative_path):
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
+
+
+image_path = resource_path('icons/newIcon.png')
 # Load the preloaded photos and place them in the grid
-photo1 = Image.open("icons/newIcon.png")
+photo1 = Image.open(image_path)
 photo1 = photo1.resize((150, 100))
 photo1 = ImageTk.PhotoImage(photo1)
 label1 = tk.Label(photo_frame, image=photo1, borderwidth=2, relief='solid', bg='black')
 label1.image = photo1
 label1.grid(row=0, column=0, sticky='nsew', padx=2, pady=2)
-
-photo2 = Image.open("icons/fireIcon2.JPG")
+image_path2 = resource_path('icons/fireIcon2.JPG')
+photo2 = Image.open(image_path2)
 photo2 = photo2.resize((100, 100))
 photo2 = ImageTk.PhotoImage(photo2)
 label2 = tk.Label(photo_frame, image=photo2, borderwidth=2, relief='solid', bg='black')
 label2.image = photo2
 label2.grid(row=0, column=1, sticky='nsew', padx=2, pady=2)
-
-photo3 = Image.open("icons/tryicon.png")
+image_path3 = resource_path('icons/tryicon.png')
+photo3 = Image.open(image_path3)
 photo3 = photo3.resize((100, 100))
 photo3 = ImageTk.PhotoImage(photo3)
 label3 = tk.Label(photo_frame, image=photo3, borderwidth=2, relief='solid', bg='black')
@@ -492,7 +722,10 @@ for i in range(5):
 
 # Create a button to apply the values from entries
 button_apply_entries = tk.Button(window, text="Apply Entry Values", command=apply_entry_values)
-button_apply_entries.grid(row=12, column=2, columnspan=2, pady=10)
+button_apply_entries.grid(row=12, column=2, columnspan=1, pady=10)
+
+button_config = tk.Button(window, text="Configuration", command=config_area)
+button_config.grid(row=12, column=3, columnspan=2, pady=10)
 
 # Create language change buttons
 button_english = tk.Button(window, text="English", command=lambda: change_language('English'))
@@ -508,13 +741,15 @@ button_italian.grid(row=13, column=3, pady=10)
 label_image = tk.Label(window)
 label_image.grid(row=1, column=0, columnspan=4)
 
+def CloseAll():
+    window.quit()
+
+
 def initialize_ui():
     current_language = get_current_language()
     update_ui_language(current_language)
 
-
 # Create a button to open another window
-
 open_button = tk.Button(window, text="Open History Window", command=lambda: open_new_window(window))
 open_button.grid(row=13, column=0, pady=10)
 window_resizable_width = config.getboolean('Window', 'resizable_width')
